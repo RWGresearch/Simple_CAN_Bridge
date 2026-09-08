@@ -60,8 +60,10 @@ up per `INSTALL.md`.
 - `can_bridge_logger.py` - the entire app (single file).
 - `INSTALL.md` - setup guide (general Windows/Python steps, then PCAN or
   SLCAN-specific steps).
-- `Logs/Captures/` - default save location offered for new trace logs
-  (created automatically the first time you start logging).
+- `Logs/` - created automatically on first run; not tracked in git.
+  - `Logs/app.log` - the app log box's history, persisted across runs.
+  - `Logs/Captures/` - default save location offered for new trace logs
+    (created the first time you start logging).
 
 ## Revision tracking
 

@@ -1,4 +1,4 @@
-# REVISION: 3
+# REVISION: 7
 """
 CAN BRIDGE + LOGGER
 --------------------
@@ -36,6 +36,28 @@ Rev 3: DBC sender-node lookup - a "Load DBC..." button (Connections panel)
        decoding, just the sender name - e.g. VCM, LBC), merged across every
        file picked. Both live-data lists gained a Node column showing that
        name per ID (blank if no DBC loaded or the ID isn't in it).
+Rev 4: clearer missing-dependency messages - the python-can/pyserial
+       startup warnings now include the exact pip install command and say
+       what's actually blocked (python-can blocks both adapter types,
+       pyserial only blocks SLCAN port auto-detect). The SLCAN Refresh
+       button also logs a message instead of silently doing nothing when
+       pyserial isn't installed.
+Rev 5: Connect no longer freezes the window - opening the adapter (a
+       SLCAN COM port that isn't actually present can block for a long
+       time at the OS level before failing) now happens on a background
+       thread instead of the GUI thread. The button reads "Connecting..."
+       (disabled) meanwhile and the row updates to Disconnect/failed once
+       the attempt finishes, same as before.
+Rev 6: Connect attempts can be cancelled - while a connect is in flight
+       the button reads "Cancel" (clickable); clicking it hands the row
+       back immediately ("not connected") without waiting for the stuck
+       OS-level open to give up. There's no way to truly kill a blocked
+       serial-port open from Python, so the background attempt keeps
+       running unseen - if it later does succeed, it's auto-closed instead
+       of leaving an orphaned connection.
+Rev 7: the app log box's contents are now also persisted to Logs/app.log
+       (appended across runs, one line per log entry, flushed immediately)
+       so history survives closing the app. Logs/ is excluded from git.
 """
 
 import bisect
@@ -74,8 +96,16 @@ BG, PANEL, FIELD = '#1e1e22', '#2a2a30', '#35353c'
 FG, FG_DIM, ACC, ERR, OK = '#dcdcdc', '#9a9aa0', '#4da3ff', '#ff6b6b', '#5fd38d'
 
 
+def default_log_folder():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Logs')
+
+
 def default_trace_folder():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Logs', 'Captures')
+    return os.path.join(default_log_folder(), 'Captures')
+
+
+def default_app_log_path():
+    return os.path.join(default_log_folder(), 'app.log')
 
 
 DIR_SETS = {'both': {'RX', 'TX'}, 'rx': {'RX'}, 'tx': {'TX'}}
@@ -379,8 +409,17 @@ class App:
         self._style()
         self.logq = queue.Queue()
         self.core = Core(self.logq.put)
+        os.makedirs(default_log_folder(), exist_ok=True)
+        self._app_log_f = open(default_app_log_path(), 'a', encoding='utf-8')
+        self._app_log_f.write(
+            f"\n--- session started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        self._app_log_f.flush()
         self.ch_ui = {}     # idx -> dict of widgets/vars
         self.tree = {}      # idx -> Treeview
+        self.pending = {}   # idx -> gen, present while a connect is in flight
+        self.conn_gen = {1: 0, 2: 0}   # idx -> attempt counter, so a stale/
+                                       # cancelled attempt's result can be
+                                       # told apart from the current one
         self._mon_sorted = {1: [], 2: []}
         self.dbc_nodes = {}   # CAN ID -> sender node name, from Load DBC...
 
@@ -492,11 +531,14 @@ class App:
         self.logbox.pack(fill='both', expand=True)
 
         if not CAN_AVAILABLE:
-            self.logq.put("python-can not installed - pip install python-can "
-                          "before connecting either adapter")
+            self.logq.put("python-can not installed - run: pip install "
+                          "python-can  (needed before connecting either "
+                          "PCAN or SLCAN adapter)")
         if not LIST_PORTS_AVAILABLE:
-            self.logq.put("pyserial's list_ports not available - type the "
-                          "SLCAN COM port manually")
+            self.logq.put("pyserial not installed - run: pip install "
+                          "pyserial  (only needed for SLCAN port "
+                          "auto-detect/refresh; type the COM port manually "
+                          "until then)")
         self._poll_n = 0
         self.root.after(100, self._poll)
 
@@ -564,6 +606,11 @@ class App:
     def _refresh_ports(self, idx):
         ui = self.ch_ui[idx]
         if ui['type'].get() != 'SLCAN':
+            return
+        if not LIST_PORTS_AVAILABLE:
+            self.logq.put("can't scan ports - pyserial not installed "
+                          "(run: pip install pyserial); type the COM port "
+                          "manually")
             return
         ports = list_serial_ports()
         ui['chan_cb'].config(values=ports)
@@ -694,6 +741,21 @@ class App:
     def toggle_conn(self, idx):
         ch = self.core.ch[idx]
         ui = self.ch_ui[idx]
+        if idx in self.pending:
+            # a connect attempt is in flight (e.g. a dead SLCAN port that
+            # Windows is taking forever to fail on) - there's no way to
+            # actually abort that blocked OS call from here, so just detach
+            # it: hand the row back to the user now, and if the attempt
+            # does eventually resolve in the background, _connect_done
+            # will notice it's stale and quietly close it instead of
+            # touching the UI.
+            del self.pending[idx]
+            ui['btn'].config(text="Connect")
+            ui['lbl'].config(text="not connected", foreground=ERR)
+            self.logq.put(f"CAN{idx}: connect cancelled - still finishing "
+                          "in the background, will auto-close if it does "
+                          "connect")
+            return
         if ch.connected:
             if self.core.bridge_on:
                 self.core.set_bridge(False)
@@ -722,10 +784,46 @@ class App:
         if not CAN_AVAILABLE:
             self.logq.put("python-can not installed - pip install python-can")
             return
+        # opening the adapter (esp. a SLCAN port that isn't actually there)
+        # can block for a long time at the OS level - do it off the GUI
+        # thread so the window doesn't freeze while it waits. The button
+        # stays clickable as a Cancel while this is in flight.
+        gen = self.conn_gen[idx] = self.conn_gen[idx] + 1
+        self.pending[idx] = gen
+        ui['btn'].config(state='normal', text="Cancel")
+        ui['lbl'].config(text="connecting...", foreground=FG_DIM)
+        threading.Thread(target=self._connect_worker,
+                         args=(idx, adapter, channel_name, bitrate, gen),
+                         daemon=True).start()
+
+    def _connect_worker(self, idx, adapter, channel_name, bitrate, gen):
+        ch = self.core.ch[idx]
         try:
             ch.connect(adapter, channel_name, bitrate)
         except Exception as exc:
+            self.root.after(0, self._connect_done, idx, adapter, channel_name,
+                            bitrate, exc, gen)
+            return
+        self.root.after(0, self._connect_done, idx, adapter, channel_name,
+                        bitrate, None, gen)
+
+    def _connect_done(self, idx, adapter, channel_name, bitrate, exc, gen):
+        if self.pending.get(idx) != gen:
+            # cancelled (or superseded by a newer attempt) before this one
+            # finished - the UI has already moved on, so just clean up
+            # quietly rather than clobbering whatever it's doing now.
+            if exc is None:
+                self.core.ch[idx].disconnect()
+                self.logq.put(f"CAN{idx}: cancelled connect to {channel_name} "
+                              "came through after all - closed it")
+            return
+        del self.pending[idx]
+        ui = self.ch_ui[idx]
+        ui['btn'].config(state='normal')
+        if exc is not None:
             self.logq.put(f"CAN{idx} connect failed: {exc}")
+            ui['btn'].config(text="Connect")
+            ui['lbl'].config(text="not connected", foreground=ERR)
             return
         ui['btn'].config(text="Disconnect")
         ui['lbl'].config(text=f"{adapter} {channel_name} @ {bitrate}",
@@ -791,10 +889,13 @@ class App:
     def _poll(self):
         while not self.logq.empty():
             line = self.logq.get_nowait()
+            stamp = time.strftime('%H:%M:%S')
             self.logbox.config(state='normal')
-            self.logbox.insert('end', time.strftime('%H:%M:%S ') + line + '\n')
+            self.logbox.insert('end', stamp + ' ' + line + '\n')
             self.logbox.see('end')
             self.logbox.config(state='disabled')
+            self._app_log_f.write(stamp + ' ' + line + '\n')
+            self._app_log_f.flush()
         self._poll_n += 1
         if self._poll_n % 2 == 0:         # refresh live data at ~5 Hz
             self._update_monitor(1)
@@ -819,3 +920,4 @@ if __name__ == '__main__':
         root.mainloop()
     finally:
         app.core.shutdown()
+        app._app_log_f.close()
